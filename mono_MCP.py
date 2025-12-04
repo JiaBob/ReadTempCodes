@@ -1,27 +1,34 @@
 import asyncio
 import json
 import os
+import sys
 from typing import List, Dict, Any
 
+# 1. Import FastMCP
 from mcp.server.fastmcp import FastMCP
+
+# 2. Import AI Libraries
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # =============================================================================
-# PART A: TOOLS
+# PART A: DEFINE TOOLS
 # =============================================================================
 app = FastMCP("my_internal_tools")
 
 @app.tool()
 def calculate_bmi(weight_kg: float, height_m: float) -> str:
     """Calculate Body Mass Index."""
-    bmi = weight_kg / (height_m ** 2)
-    category = "Normal"
-    if bmi < 18.5: category = "Underweight"
-    if bmi > 25: category = "Overweight"
-    return f"BMI is {bmi:.2f} ({category})"
+    try:
+        bmi = weight_kg / (height_m ** 2)
+        category = "Normal"
+        if bmi < 18.5: category = "Underweight"
+        if bmi > 25: category = "Overweight"
+        return f"BMI is {bmi:.2f} ({category})"
+    except Exception as e:
+        return f"Error calculating BMI: {e}"
 
 @app.tool()
 def plan_trip(destination: str, days: int, activity_type: str = "leisure") -> str:
@@ -34,10 +41,11 @@ def plan_trip(destination: str, days: int, activity_type: str = "leisure") -> st
     })
 
 # =============================================================================
-# PART B: IMPROVED EXECUTION LOGIC
+# PART B: HELPERS
 # =============================================================================
 
 async def get_openai_tools(mcp_app: FastMCP) -> List[Dict[str, Any]]:
+    """Extract schemas from FastMCP to send to OpenAI."""
     result = await mcp_app.list_tools()
     return [{
         "type": "function",
@@ -50,69 +58,59 @@ async def get_openai_tools(mcp_app: FastMCP) -> List[Dict[str, Any]]:
 
 async def execute_tool_locally(mcp_app: FastMCP, name: str, arguments: dict) -> str:
     """
-    Robustly executes a tool and cleans the output.
+    Executes tool safely handling the Tuple/List/Object return variations.
     """
-    raw_result = await mcp_app.call_tool(name, arguments)
-
-    # DEBUG: Uncomment if you want to see exactly what comes back
-    # print(f"DEBUG RAW: {type(raw_result)} - {raw_result}")
-
-    content_list = []
-    
-    # 1. Handle Tuple return (The issue you saw: ([TextContent], MetaDict))
-    if isinstance(raw_result, tuple):
-        # The first item is usually the list of content objects
-        content_list = raw_result[0]
-    
-    # 2. Handle Object with .content attribute (Standard MCP)
-    elif hasattr(raw_result, 'content'):
-        content_list = raw_result.content
+    try:
+        raw_result = await mcp_app.call_tool(name, arguments)
         
-    # 3. Handle direct list
-    elif isinstance(raw_result, list):
-        content_list = raw_result
+        content_list = []
         
-    # 4. Handle direct string/other
-    else:
-        return str(raw_result)
-
-    # Extract text from the list of content objects
-    final_text = []
-    for item in content_list:
-        # Check for object attribute
-        if hasattr(item, 'text'):
-            final_text.append(item.text)
-        # Check for dictionary key
-        elif isinstance(item, dict) and 'text' in item:
-            final_text.append(item['text'])
+        # 1. Handle Tuple return (Fixes the error you saw)
+        if isinstance(raw_result, tuple):
+            content_list = raw_result[0]
+        # 2. Handle Object with .content
+        elif hasattr(raw_result, 'content'):
+            content_list = raw_result.content
+        # 3. Handle List directly
+        elif isinstance(raw_result, list):
+            content_list = raw_result
         else:
-            final_text.append(str(item))
-            
-    return "\n".join(final_text)
+            return str(raw_result)
+
+        # Extract actual text
+        final_text = []
+        for item in content_list:
+            if hasattr(item, 'text'):
+                final_text.append(item.text)
+            elif isinstance(item, dict) and 'text' in item:
+                final_text.append(item['text'])
+            else:
+                final_text.append(str(item))
+                
+        return "\n".join(final_text)
+    except Exception as e:
+        return f"Tool execution failed: {str(e)}"
 
 # =============================================================================
-# PART C: AGENT LOOP (WITH ITERATIVE EXECUTION)
+# PART C: MAIN STREAMING LOOP
 # =============================================================================
 
 async def main():
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-        print("Error: OPENROUTER_API_KEY not found.")
+        print("Error: OPENROUTER_API_KEY not set.")
         return
         
     llm = AsyncOpenAI(
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
-        default_headers={
-            "HTTP-Referer": "http://localhost",
-            "X-Title": "LocalApp"
-        }
+        default_headers={"HTTP-Referer": "http://localhost", "X-Title": "LocalStream"}
     )
     
     system_tools = await get_openai_tools(app)
     messages = []
 
-    print("\n--- Start Chatting (Type 'quit' to exit) ---")
+    print("\n--- Streaming Agent (Type 'quit' to exit) ---")
     
     while True:
         user_input = input("\nYou: ").strip()
@@ -120,61 +118,101 @@ async def main():
             break
             
         messages.append({"role": "user", "content": user_input})
+        print("\nAI: ", end="", flush=True)
         
-        # --- INNER LOOP: Keep processing until the AI stops calling tools ---
+        # --- AGENT LOOP (Handles Multi-Step Logic) ---
         while True:
             try:
-                response = await llm.chat.completions.create(
+                stream = await llm.chat.completions.create(
                     model="anthropic/claude-3.5-sonnet",
                     messages=messages,
-                    tools=system_tools
+                    tools=system_tools,
+                    stream=True # ENABLE STREAMING
                 )
+
+                final_content = ""
+                tool_calls_buffer = {} # Dict to re-assemble chunked tool calls
                 
-                msg = response.choices[0].message
+                # --- STREAM PROCESSING ---
+                async for chunk in stream:
+                    delta = chunk.choices[0].delta
+
+                    # 1. Stream Text to Console
+                    if delta.content:
+                        print(delta.content, end="", flush=True)
+                        final_content += delta.content
+
+                    # 2. Buffer Tool Calls (They arrive in pieces)
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in tool_calls_buffer:
+                                tool_calls_buffer[idx] = {"id": "", "name": "", "args": ""}
+                            
+                            if tc.id: tool_calls_buffer[idx]["id"] += tc.id
+                            if tc.function.name: tool_calls_buffer[idx]["name"] += tc.function.name
+                            if tc.function.arguments: tool_calls_buffer[idx]["args"] += tc.function.arguments
+
+                # --- END OF ONE RESPONSE TURN ---
                 
-                # Check if the AI wants to call tools
-                if msg.tool_calls:
-                    # 1. Print the AI's "Thoughts" before the tool call (if any)
-                    if msg.content:
-                        print(f"\nAI: {msg.content}")
+                # If we have tool calls, we must process them and loop again
+                if tool_calls_buffer:
+                    print("\n\n[Processing tools...]")
                     
-                    # 2. Add the "Call Intent" to history
-                    messages.append(msg)
-                    
-                    print("\n[AI is executing tools...]")
-                    
-                    # 3. Execute all requested tools
-                    for tool_call in msg.tool_calls:
-                        func_name = tool_call.function.name
-                        args = json.loads(tool_call.function.arguments)
+                    # 1. Reconstruct OpenAI-compliant tool_calls list
+                    reconstructed_calls = []
+                    for idx in sorted(tool_calls_buffer.keys()):
+                        t = tool_calls_buffer[idx]
+                        reconstructed_calls.append({
+                            "id": t["id"],
+                            "type": "function",
+                            "function": {"name": t["name"], "arguments": t["args"]}
+                        })
+
+                    # 2. Add Assistant's "Intent" to history
+                    messages.append({
+                        "role": "assistant",
+                        "content": final_content if final_content else None,
+                        "tool_calls": reconstructed_calls
+                    })
+
+                    # 3. Execute Tools Locally
+                    for tool_call in reconstructed_calls:
+                        func_name = tool_call["function"]["name"]
+                        args_str = tool_call["function"]["arguments"]
+                        call_id = tool_call["id"]
                         
-                        print(f" > Calling: {func_name}({args})")
+                        print(f" > Executing {func_name}...")
                         
-                        # Execute cleanly
-                        tool_output = await execute_tool_locally(app, func_name, args)
-                        
-                        print(f" > Output: {tool_output[:100]}...") # Print preview only
-                        
-                        # Add result to history
+                        try:
+                            args = json.loads(args_str)
+                            # Call the robust local executor
+                            result_text = await execute_tool_locally(app, func_name, args)
+                        except Exception as e:
+                            result_text = f"Error parsing arguments: {e}"
+
+                        # 4. Add Tool Result to history
                         messages.append({
                             "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": tool_output
+                            "tool_call_id": call_id,
+                            "content": result_text
                         })
                     
-                    # 4. CONTINUE LOOP: Send results back to LLM and see if it wants more tools
-                    print("[Sending results back to AI process...]")
-                    continue 
+                    print("[Sending results back to AI...]\n")
+                    print("AI: ", end="", flush=True)
+                    # LOOP CONTINUES (The inner while True repeats)
+                    continue
 
                 else:
-                    # No tool calls? We are done.
-                    print(f"\nAI: {msg.content}")
-                    messages.append(msg)
-                    break # Break inner loop, wait for user input
+                    # No tools called, this was a final text response
+                    messages.append({"role": "assistant", "content": final_content})
+                    break # Break inner loop, wait for user
 
             except Exception as e:
-                print(f"API Error: {e}")
+                print(f"\nError in stream: {e}")
                 break
 
 if __name__ == "__main__":
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
